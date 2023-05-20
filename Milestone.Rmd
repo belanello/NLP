@@ -1,0 +1,1241 @@
+---
+title: "Predicting next words using N-gram models"
+author: "Ayako Nagao"
+date: "30 April 2023"
+output: html_document
+---
+
+```{r setup, include = FALSE, eval=TRUE}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE, cache=TRUE, cache.lazy = FALSE)
+```
+
+>#### 1. Overview  
+
+Whenever we type texts on search engines, word documents, mobile phone apps etc, applications often show us possible next words we are going to type in. In this project, we try to build the predictive model of English texts that works in the same way using the large text dataset sourced from twitter posts, news and blogs. The goal is to build the model with accuracy as well as reasonable speed. Below is a breakdown of the tasks. I will try to get insights to achieve the goal by building the first simple model.
+
+*Goal* :  
+  
+To build the model that predict the next word according to the previous inputs with accuracy and reasonable speed.
+
+*Steps* :  
+
+1. Obtain the dataset and sample data for modeling.  
+2. Clean and analyze the data.
+4. Find the optimal model to predict a next word.  
+4. Evaluate the model.
+5. Repeat the process 2-4. 
+6. Deploy it in Shiny server for users to try.
+
+*Questions to consider* :  
+
+1. How can we efficiently store a N-gram model?
+2. Do we need all the words that appear in the corpus or if it appears less frequent than others, can it be removed from the corpus (What is the size of the word dictionary)?  
+3. How much do we need to go backward in the previous inputs to predict the next word?
+4. How can we evaluate the model accuracy?
+5. Can the model we are going to build be deployed in Shiny server with limited resources?
+  
+
+>#### 2. Data  
+
+
+##### 2.1 Load the data
+
+```{r download_data,  appendix = TRUE}
+# ------------------------------------------------------------------------------
+# 2.1 Data section/loading data
+# ------------------------------------------------------------------------------
+
+# files URL
+url <- 'https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip'
+
+
+if (!file.exists('Coursera-SwiftKey.zip')){
+  download.file(url, 'Coursera-SwiftKey.zip')
+  }
+```
+First, we download the data from 'https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip'  then read text data only in English.  
+
+
+```{r read_data,  appendix = TRUE}
+
+con <- unz('Coursera-SwiftKey.zip','final/en_US/en_US.blogs.txt')
+blogs <- readLines(con,skipNul = TRUE)
+close(con)
+
+con <- unz('Coursera-SwiftKey.zip','final/en_US/en_US.news.txt')
+news <- readLines(con,skipNul = TRUE)
+close(con)
+
+con <- unz('Coursera-SwiftKey.zip','final/en_US/en_US.twitter.txt')
+twitter <- readLines(con,skipNul = TRUE)
+close(con)
+
+
+```
+
+##### 2.2 Details of the data  
+
+Below outputs are details of downloaded data. N.documents is the number of documents which consist of one or more sentences, N.words is the count of all words and N.unique.words is the count of unique words in each file.  
+
+```{r data_info,  appendix = TRUE, eval=TRUE}
+# ------------------------------------------------------------------------------
+# 2.2 Basic information of data
+# ------------------------------------------------------------------------------
+# Load libraries
+library(tokenizers)
+library(stringr)
+library(dplyr)
+library(lexicon)
+library(data.table)
+
+# define function changing units of size
+getMb <- function(x) paste(round(x/1e+6,2),'MB')
+
+# Check object sizes
+Object.size <- c(object.size(twitter), object.size(news), object.size(blogs))
+
+
+# Counts the number of documents 
+N.documents <- c(length(twitter),length(news),length(blogs))
+
+# Tokenize documents into words
+blogs_w <- unlist(tokenize_words(blogs))
+news_w <- unlist(tokenize_words(news))
+twitter_w <- unlist(tokenize_words(twitter))
+
+# Counts the number of words
+n_blogs_w <- length(blogs_w)
+n_news_w <- length(news_w)
+n_twitter_w <- length(twitter_w)
+
+# Counts the number of unique words
+u_blogs_w <- length(unique(blogs_w))
+u_news_w <- length(unique(news_w))
+u_twitter_w <- length(unique(twitter_w))
+
+# Make a data.frame of all the information
+N.words <- c(n_twitter_w, n_news_w, n_blogs_w)
+N.unique.words <- c(u_twitter_w, u_news_w, u_blogs_w)
+
+total <- c(sum(Object.size), sum(N.documents), 
+           sum(N.words), sum(N.unique.words))
+
+info <- data.frame(Object.size, N.documents, N.words, N.unique.words)
+info <- rbind(info, total)
+rownames(info) <- c("en_US.twitter.txt","en_US.news.txt","en_US.blogs.txt","total")
+
+info$Object.size <- getMb(info$Object.size)
+info
+```
+
+##### 2.3 Subset the data  
+
+For the purpose of exploratory analysis we subset 50% of the data and split them into training set(70%), test set(20%) and held-out set(10%). First combine all twitter, blogs and news data and randomly select 50% of data and split it accordingly.
+
+
+```{r subset_data,  appendix = TRUE}
+# ------------------------------------------------------------------------------
+# 2.3 Subset the data
+# ------------------------------------------------------------------------------
+
+# Function to get indices for subset 
+getSubIdx <- function(obj, frac){
+  set.seed(1563)
+  sub <- floor(length(obj)*frac)
+  sample(length(obj),sub)
+}
+
+all <- c(twitter, blogs, news)
+
+# Get half of the data
+sub_idx <- getSubIdx(all, 0.5)
+sub <- all[sub_idx]
+
+# Use 70% for training and 30% for testing and development
+train_idx <- getSubIdx(sub, 0.7)
+train <- sub[train_idx]
+test_dev <- sub[-train_idx]
+
+# Use 10% for development out of test set
+test_idx <- getSubIdx(test_dev, 0.66)
+test <- test_dev[test_idx]
+dev <- test_dev[-test_idx]
+
+train_len <- length(train)
+test_len <- length(test)
+dev_len <- length(dev)
+
+```
+After subset the data we have `r train_len` documents for training, `r test_len` documents for testing, `r dev_len` documents for tuning the model.  
+
+
+##### 2.4 Clean the data  
+
+In order to get useful features of input data, we need to clean the data before we conduct exploratory analysis. 
+Our training dataset is a list of documents. First, we split them into a single sentence > split them into words par each sentence > clean sentences as below
+
+1. Standardize the apostrophe (' and ’).
+2. Replace words from Non-English languages / words with numbers / words with profane or offensive meanings with "UNK" (unknown, treat as regular words).  
+3. Replace the words if they appears less frequent (words with low probability) with "UNK.  
+
+After the cleaning steps 2, we need to decide how many times the words have to appear for being used as parameters of the model. Below outputs are the rates of the coverage when we use words that appear at least 2/3/4/5 times. We can see from below outputs, even though we use 1/4 of all the unique words, we can cover 98.9% of all the words that appears in all the sentences. Thus we replace the words with "UNK" if it appears less than 5 times at the step 3.   
+
+
+```{r data_cleaning,  appendix=TRUE}
+# ------------------------------------------------------------------------------
+# 2.4 Data cleaning
+# ------------------------------------------------------------------------------
+
+# Define the function to clean the data
+# Take list of documents and return data.table
+
+prep <- function(data){
+  # Break up documents into sentences
+  sentences <- tokenize_sentences(data)
+  
+  # Break up sentences into words 
+  words <- tokenize_words(data.frame(sentences = unlist(sentences))[,1], 
+                 strip_numeric = TRUE, simplify = TRUE)
+  
+  # Subset only the sentences (remove the sentences of length 1)
+  len_words <- sapply(words, length)
+  idx_subset <- which(len_words > 1)
+  words <- words[idx_subset]
+  
+  # Make a data.table of words for cleaning 
+  lengths <- sapply(words, length)
+  ids <- rep(1:length(words), times=lengths)
+  dt <- data.table(id = ids, word = unlist(words))
+  
+  # Make different apostrophe same (’ and ')
+  # Replace non-alphabets with <UNK>
+  # Replace profane words with <UNK>
+  
+  profs <- unique(c(profanity_alvarez, profanity_arr_bad, profanity_banned))
+   
+  dt[, word := str_replace_all(word, "’", "'")]
+  dt[str_detect(word, "[^a-z\\.']"), word := "UNK"]
+  dt[word %chin% profs, word := "UNK"]
+  dt[1:.N]
+}
+
+train_dt <- prep(train)
+
+```
+
+
+
+
+```{r check_coverage,  appendix=TRUE}
+
+# Counts words for checking coverage
+wc <- train_dt %>%
+  count(word, sort=TRUE) 
+
+# Make summary data.frame in different scenarios
+twice <- wc[n >= 2,]
+three_times <- wc[n >= 3,]
+four_times <- wc[n >= 4,]
+five_times <- wc[n >= 5,]
+
+total_n <-wc[, sum(n)]
+
+subsets_n <- c(total_n, twice[, sum(n)], three_times[, sum(n)], 
+               four_times[, sum(n)], five_times[, sum(n)])
+unique_n <- c(wc[, uniqueN(word)], twice[, uniqueN(word)], 
+              three_times[, uniqueN(word)], four_times[, uniqueN(word)],
+              five_times[, uniqueN(word)])
+coverage <- paste(round((subsets_n/total_n)*100, 2), "%")
+
+df <- data.frame(N.words.total = wc[, sum(n)],
+                 N.words.subset = subsets_n,
+                 N.unique.words = unique_n,
+                 Coverage = coverage)
+
+rownames(df) <- c("Use all the words",
+                  "Use the words freq >= 2",
+                  "Use the words freq >= 3",
+                  "Use the words freq >= 4",
+                  "Use the words freq >= 5")
+
+df
+```
+
+
+
+
+```{r replace_low_prob_words,  appendix=TRUE}
+
+# Replce the words with <UNK> if it appears less than 5 times
+# First, make the vocabulary list
+vocab <- wc[n >= 5, word]
+
+# Define the function to replace the out of vocabulary words with "UNK"
+# Take a list of documents or data.table and return data.table
+prep2 <- function(data, vocab){
+  
+  if (!is.data.table(data)){
+    data <- prep(data)
+    data[!(word %chin% vocab), word := "UNK"]
+  }else{
+    data[!(word %chin% vocab), word := "UNK"]
+  }
+  
+  data[1:.N]
+}
+
+train_dt <- prep2(train_dt, vocab)
+
+```
+
+>#### 3. Frequencies of words/N-grams  
+
+Now we have a list of cleaned sentences to analyze. To build the predictive model, we need to know frequencies of each word/combination of words.  
+
+##### 3.1 Word Distributions  
+
+```{r wordcounts_2, appendix=TRUE}
+# ------------------------------------------------------------------------------
+# 3. Exploratory Analysis
+# ------------------------------------------------------------------------------
+library(ggplot2)
+library(forcats)
+
+wc2 <- train_dt %>% 
+  count(word, sort = TRUE) %>%
+  mutate(prob = n/sum(n), 
+         word2 = fct_reorder(word, n, .desc = TRUE)) 
+
+total_n <- wc2[, sum(n)]
+vocab_n <- wc2[, .N]
+unk_n <- wc2[word == "UNK", sum(n)]
+unk_p <- paste(round((unk_n/total_n)*100, 1), "%")
+
+```
+
+Below Fig.1 shows distribution of top 50 words of `r vocab_n` unique words. "*The*" appears the most, followed by "*to*", "*and*", "*a*" and so on. "*The*" has the highest probability if we do not consider the previous history. 
+
+
+```{r figure1, appendix=TRUE,  fig.dim=c(8,3)}
+
+# Unigram word distribution plot
+g <- ggplot(wc2[1:50], aes(word2, n)) + geom_col() 
+g <- g + scale_x_discrete(guide = guide_axis(angle = 45)) 
+g <- g + labs(title = "fig.1: Distributions of Words (Top 50 words)",
+             x = "word", y = "frequency")
+g
+
+```
+
+
+In the data cleaning process, low probability words(appears less than 5 times), profane words, numbers, non-English words were replaced by "UNK"(unknown). The count of unknown words is `r unk_n`, which is the 8th place from the top and around `r unk_p` of the total word counts in the training data. We treat UNK as regular words in order to see the probability.
+
+##### 3.2 Frequencies of Sequence of Words (N-gram)
+
+N-gram is a sequence of N words. For example, 2-gram(bigram) of the sentence  "*The sun goes down.*"  are *"The sun", "sun goes", "goes down"*. In the same way we can generate longer N-grams. Using N-grams is a good way to know how the words appear in different contexts. Table.1 is 10 most frequent sequences in different N-grams.  
+
+```{r get_ngrams, appendix=TRUE}
+# ==============================================================================
+# Tokenize sentences into n-gram tokens
+
+# Define a function to make a data.table of words into a sentence vector 
+# Take data.table and return a vector of sentences
+makeSentence <- function(dt){
+  dt[, sentence := str_c(word, collapse = " "), by = id][,word := NULL]
+  dt <- unique(dt)
+  as.vector(unlist(dt[,.(sentence)]))
+}
+
+train_sent <- makeSentence(train_dt)
+
+# Define the function to make n-grams
+# Take a list of sentences and return a vector of ngrams
+makeNgram <- function(data, n){
+  
+  data <- str_c(strrep("BOS ",n-1), data, strrep(" EOS", n-1), sep = "")
+  ngram <- tokenize_ngrams(data, n = n, lowercase = FALSE, simplify = TRUE)
+  unlist(ngram)
+  
+}
+
+unigram <- makeNgram(str_c(train_sent, " EOS"), 1)
+bigram <- makeNgram(train_sent, 2)
+trigram <- makeNgram(train_sent, 3)
+fourgram <- makeNgram(train_sent, 4)
+
+```
+
+```{r get_ngram_counts,  appendix = TRUE}
+
+# Define the function to get the counts of ngrams
+# Take a vector of ngrams and return data.table
+getNgramCounts <- function(data){
+  count <- data.table(ngram = data)
+  count[, n := .N, by = ngram]
+  count <- unique(count)
+  count[order(n, decreasing = TRUE)]
+}
+
+uni_counts <- getNgramCounts(unigram)
+bi_counts <- getNgramCounts(bigram)
+tri_counts <- getNgramCounts(trigram)
+four_counts <- getNgramCounts(fourgram)
+
+```
+
+```{r comparison_table,  appendix=TRUE}
+library(kableExtra)  
+# Define the function to get top10 ngrams
+# Take a data.table and return data.table
+filterTop10 <- function(data){
+  data %>% 
+    filter(str_detect(ngram, "BOS|EOS", negate = TRUE)) %>%
+    top_n(10, wt = n)
+}
+
+comparison <- cbind(1:10, wc2[1:10, .(word, n)], filterTop10(bi_counts),
+                    filterTop10(tri_counts), filterTop10(four_counts))
+
+colnames(comparison) <- c("Rank", "Unigram", "counts", "2-gram", "counts",
+                          "3-gram", "counts", "4-gram", "counts")
+
+kbl(comparison, booktabs = T, caption = "Table.1: The most frequent N-grams") %>%
+  kable_styling(position = "left", font_size = 10, full_width = FALSE) %>%
+  column_spec(c(2,4,6,8), width = "3.5cm", bold = TRUE) %>%
+  column_spec(c(3,5,7,9), width = "2cm")
+```
+
+As N gets larger, the frequencies of each N-gram is getting less because they are more restricted. What about the total number of unique N-grams? Below outputs shows the total count of each N-grams(Total.Count), the number of unique N-grams(Unique.Ngrams.Count), the number and percentage of N-grams which appeared only once(Singleton.Count/Percentage.Singleton).  
+
+
+
+```{r counts_summary,  appendix=TRUE}
+uni_n <- wc2[,sum(n)]
+bi_n <- bi_counts[str_detect(ngram, "BOS|EOS", negate = TRUE), sum(n)]
+tri_n <- tri_counts[str_detect(ngram, "BOS|EOS", negate = TRUE), sum(n)]
+four_n <- four_counts[str_detect(ngram, "BOS|EOS", negate = TRUE), sum(n)]
+
+uni_types <- wc2[,.N]
+bi_types <- bi_counts[str_detect(ngram, "BOS|EOS", negate = TRUE), .N]
+tri_types <- tri_counts[str_detect(ngram, "BOS|EOS", negate = TRUE), .N]
+four_types <- four_counts[str_detect(ngram, "BOS|EOS", negate = TRUE), .N]
+
+uni_one <- wc2[n == 1, .N]
+bi_one <- bi_counts[n == 1 & str_detect(ngram, "BOS|EOS", negate = TRUE), .N]
+tri_one <- tri_counts[n == 1 & str_detect(ngram, "BOS|EOS", negate = TRUE), .N]
+four_one <- four_counts[n == 1 & str_detect(ngram, "BOS|EOS", negate = TRUE), .N]
+
+Total.Count <- c(uni_n, bi_n, tri_n, four_n)
+Unique.Ngrams.Count <- c(uni_types, bi_types, tri_types, four_types)
+Singleton.Count <- c(uni_one, bi_one, tri_one, four_one)
+Percentage.Singleton <- paste(round((Singleton.Count/Total.Count)*100, 2), "%") 
+
+summary <- data.frame(Total.Count, Unique.Ngrams.Count, Singleton.Count, Percentage.Singleton)
+row.names(summary) <- c("unigram", "2-gram", "3-gram", "4-gram")
+summary
+
+```
+As N gets larger, the number of unique N-grams dramatically gets larger. It is natural because N-grams are possible combinations of `r uni_types` words. But is it necessary to keep all the combinations? We can say 4-grams that appeared once is likely to appear once in `r four_n` times.  
+
+
+##### 3.3 Summary of Findings   
+
+- The majority of the most frequent words are prepositions, conjunctions or pronouns. 
+- 1.5 % of the words are coded unknown(UNK), they were originally profanity, non-English or with low probability. 
+- The combinations of the word that appear in sentences varies in millions of ways. Especially in 4-gram, majority of them have very low probability. We can assume that most of them might be particular to this training dataset. Thus we need to add more data to generalize or just exclude them.
+
+>#### 4. Modeling  
+
+Predicting next words is hard because the number of options are almost infinity in many cases. The important things in this task is to show users the options that are most likely and are grammatically correct. 
+
+##### 4.1 Predicting next word using N-gram  
+We use N-gram model to predict the next word according to the previous set of the words in the sentence. Look at the example.
+  
+Example sentence: *"The sun goes (  )"*  
+We want to predict the last word  of this sentence.  
+
+- 2-gram model: predict the word according to the previous one word.(in this case, *"goes"*)
+- 3-gram model: predict the word according to the previous two words. (*"sun goes"*)
+- 4-gram model: predict the word according to the previous three words.(*"The sun goes"*)  
+
+How do we compute? It's simply by the counts of N-grams. Please see below outputs.
+
+
+```{r probability_tables,  appendix=TRUE}
+# ------------------------------------------------------------------------------
+# 4.Modeling  
+# ------------------------------------------------------------------------------
+# Define a function to generate probability table
+# Take data.table of the ngram counts/n and return data.table with probability
+getProbTable <- function(data, n){
+  if(n == 1){
+    data[, `:=` (history = NA,
+                 word = ngram,
+                 N = sum(n),
+                 prob = n/sum(n))]
+    setcolorder(data, c("history", "word", "N", "n", "prob","ngram"))
+    data[1:.N]
+  }else{
+    pattern = str_glue("^(\\S+", strrep("\\s\\S+", n-2), ")\\s(\\S+)$")
+    data[, `:=`(history = str_extract(ngram, 
+                                      pattern = pattern, 
+                                      group = 1),
+                word = str_extract(ngram, 
+                                   pattern = pattern, 
+                                   group = 2))]
+    data[, N := sum(n), by = history][, prob := n/N]
+    setcolorder(data, c("history", "word", "N", "n", "prob","ngram"))
+    data[1:.N]
+  }
+}
+
+uni_table <- getProbTable(uni_counts, 1)
+bi_table <- getProbTable(bi_counts, 2)
+tri_table <- getProbTable(tri_counts, 3)
+four_table <- getProbTable(four_counts, 4)
+
+```
+
+*Example of 4-gram probabilities*  
+
+```{r fourgram_model_example, appendix=TRUE}
+four_table[history == "the sun goes"][order(prob, decreasing = TRUE)]
+```
+
+There are 28(N) 4-grams that start with *"the sun goes"*(history), and 25(n) of them end with *"down"*(word). Therefore, *"down"* has the highest probability(25/28 $\approx$ 0.89) in this case. 
+
+*Formula to calculate the probability of 4-gram model for the example*
+
+$$P(down\,|\,the\,sun\,goes) = \dfrac{Counts\,of\,<the\,sun\,goes\,+\,down>}{Counts\,of\,<the\,sun\,goes\,+\,???(any\, words)>}$$  
+
+  
+This can be translated that the probability of next word being *"down"*, given that the previous set of words is *"the sun goes"*, is the counts of 4-gram <the sun goes + down> divided by the total counts of 4-gram starting with *"the sun goes"*, thus the probabilities of the 4-grams with the same history sums up to 1. In  same way we construct the formula for other N-grams.
+
+
+##### 4.2 Backoff Model and Interpolation  
+
+In the previous section we tried to predict the word using 4-gram model, and we found the word quite reasonable. But what if we don't have the exact combination of the words in our training set? For example, if the sentence is *"The moon goes ()"*, then we don't have 4-gram and 3-gram that matches, but we do have 2-grams that has history of *"goes"*. Therefore, we can use 2-grams to predict the word. It is called Back-off model because it back-offs to lower-order N-grams till find the matches. The back-off model requires modification of probability mass to keep the sum of probabilities of the all possible options Not greater than one. 
+
+Interpolation is using all available N-gram probabilities weighted by the values between 0 and 1. This makes computation simpler than backoff model. In this project, we use Interpolation model. Below outputs are probabilities of word *"down"* using all the N-grams(4 to 1).  
+
+```{r interpolation_model_test, appendix=TRUE}
+# ------------------------------------------------------------------------------
+# 4.2 Backoff Model and Interpolation 
+
+down_4 <- four_table[history == "the sun goes" & word == "down"]
+down_3 <- tri_table[history == "sun goes" & word == "down"]
+down_2 <- bi_table[history == "goes" & word == "down"]
+down_1 <- uni_table[word == "down"]
+
+interpolation_df <- data.frame(rbind(down_4, down_3, down_2, down_1))
+row.names(interpolation_df) <- c("4-gram", "3_gram", "2_gram", "unigram")
+
+interpolation_df
+
+```
+
+The probabilities of all options of Each N-grams have to sum up to 1. In order to make a probability distribution between 0 and 1, we need values to multiply each probability. For example, if we multiply all N-gram option by 0.25, those will sum up to 1, and probability of next word being *"down"* will be between 0 and 1. But is it good idea to multiply by the same values? We need to put more weight on reliable N-grams.  
+
+##### 4.3 Find the best parameters using held-out dataset  
+
+*Formula for a simple interpolation*  
+
+$$\hat{P}(down\,|\,the\,sun\,goes) \approx \lambda_{1} P(down) + \lambda_{2}P(down\,|\,goes) + \lambda_{3}P(down\,|\,sun\,goes) + \lambda_{4}P(down\,|\, the\,sun\,goes) \\
+where\,\,  \lambda_{1} + \lambda_{2} + \lambda_{3} + \lambda_{4}\,= 1$$
+  
+If we set $\lambda_{1}$ to $\lambda_{4}$ values in above formula c(0.25, 0.25, 0.25, 0.25) respectively, the probability of the next word after *"the sun goes"* being *"down"* will be modified as below.  
+
+
+```{r interpolation_example, appendix=TRUE}
+# ------------------------------------------------------------------------------
+# 4.3 Find the best parameters using held-out dataset  
+
+interpolation_df$lambda <- c(0.25, 0.25, 0.25, 0.25)
+interpolation_df$prob <- round(interpolation_df$prob, 8)
+interpolation_df$prob_times_lambda <- round(interpolation_df$prob*interpolation_df$lambda, 8)
+interpolation_df <- rbind(interpolation_df[,c("history",
+                                              "word", 
+                                              "prob",
+                                              "lambda",
+                                              "prob_times_lambda")],
+                          c("", "", "", "",sum(interpolation_df$prob_times_lambda)))
+row.names(interpolation_df)[5] <- "modified.prob"
+interpolation_df
+
+
+```
+
+Then how can interpolation model help us to predict the next word according to the previous input? Here is the top 5 words ordered by the modified probability using above formula. Simply subset all the N-gram tables by its history and combine probabilities of the same word which were multiplied by respective values of lambda. We can show users options with highest probabilities. Below output shows the top 5 words with highest probabilities for the previous example.  
+
+
+```{r example_of_prediction, appendix=TRUE}
+
+
+combined <- rbind(four_table[history == "the sun goes", .(history, word, prob)],
+                  tri_table[history == "sun goes", .(history, word, prob)],
+                  bi_table[history == "goes", .(history, word, prob)],
+                  uni_table[,.(history, word, prob)])
+
+combined[, .(modified.prob = sum(prob*0.25)), by = word][order(modified.prob, 
+                                      decreasing = TRUE)][1:5]
+
+
+```
+
+In this example, equal values of lambda worked well enough, but we do not know which N-gram needs more weight. To find optimal values of lambda, we use our held-out dataset(the data we did not use for training) to calculate probability of the sentence using different sets of lambda values and see which set gives the highest probability to the each sentence on average. The probability of the sentence is calculated as below. Since it is a product of the probability of each word, the value becomes very small, thus we use sum of log probabilities as metrics rather than raw probabilities.  
+
+
+*Probability of the sentence (length N)*
+$$ P(sentence) = P(word_{1}) \times P(word_{2}) \times ... \times P(word_{N})
+ = \exp(logP(word_{1}) + logP(word_{2}) + ... + logP(word_{N})) $$
+ 
+Lambda values were generated all possible way in 0.1 interval excluding $\lambda_{1}$(unigram weight) = 0 (we always need lowest order N-gram), which sums up 220 patterns in total. we calculate log probabilities of the sentences using each set of lambdas and take the average. Fig.2 shows the average log probability of 10000 sentences grouped by how we distributed the weights. 
+
+```{r preprocess_devset, appendix=TRUE}
+# Preprocess devset
+dev <- prep2(dev, vocab)
+dev <- makeSentence(dev)
+```
+
+
+
+```{r functions_find_probability,  appendix=TRUE}
+
+# Define the functions which gives the probability of each word in the 
+# sentence 
+
+# Take a single sentence and return a probability vector
+getUniProbs <- function(s){
+
+  n <- length(s)
+  probs <- rep(0, n)
+  for (i in 1:n){
+    probs[i] <- uni_table[word == s[i], prob]
+  }
+  probs
+}
+
+getBiProbs <- function(s){
+  
+  n <- length(s)
+  probs <- rep(0, n)
+  p <- bi_table[history == "BOS" & word == s[1], prob]
+  if(length(p) > 0) probs[1] <- p
+
+  for (i in 2:n){
+    p <- bi_table[history == s[i-1] & word == s[i], prob]
+    if (length(p) > 0) probs[i] <- p
+      
+  }
+  probs
+}
+
+getTriProbs <- function(s){
+  
+  n <- length(s)
+  probs <- rep(0, n)
+  p <- tri_table[history == "BOS BOS" & word == s[1], prob]
+  if(length(p) > 0) probs[1] <- p
+  
+  p2 <- tri_table[history == paste("BOS", s[1]) & word == s[2], prob]
+  if(length(p2) > 0) probs[2] <- p2
+  
+  for (i in 3:n){
+    p <- tri_table[history == paste(s[i-2], s[i-1]) & word == s[i], prob]
+    if (length(p) > 0) probs[i] <- p
+    
+  }
+  probs
+}
+
+getFourProbs <- function(s){
+  
+  n <- length(s)
+  probs <- rep(0, n)
+  p <- four_table[history == "BOS BOS BOS" & word == s[1], prob]
+  if(length(p) > 0) probs[1] <- p
+  
+  p2 <- four_table[history == paste("BOS BOS", s[1]) & word == s[2], prob]
+  if(length(p2) > 0) probs[2] <- p2
+  
+  p3 <- four_table[history == paste("BOS", s[1], s[2]) & word == s[3], prob]
+  if(length(p3) > 0) probs[3] <- p3
+  
+  
+  for (i in 4:n){
+    p <- four_table[history == paste(s[i-3], s[i-2], s[i-1]) & word == s[i], prob]
+    if (length(p) > 0) probs[i] <- p
+    
+  }
+  probs
+}
+
+
+```
+
+```{r function_to_get_probDT, appendix=TRUE}
+# Define a function to calculate probabilities for each N-gram
+# Take a list of sentences
+# Return a data.table of id, and four columns of each N-gram probabilities
+getProbsDT <- function(sentences){
+  # add " EOS" to all the sentences
+  sentences <- str_c(sentences, " EOS")
+  # Convert a list of sentenes to a list of words per sentence
+  sent_words <- sapply(sentences, str_split, 
+                       pattern = " ", simplify = TRUE, USE.NAMES = FALSE)
+  # The number of elements in a list of sentences 
+  len <- length(sentences)
+  # The number of elements in a list of words per sentence
+  sent_length <- sapply(sent_words, length, USE.NAMES = FALSE)
+  # Make a empty data.table
+  dt <- data.table(id = rep(1:len, times = sent_length),
+                   unigram = rep(0, sum(sent_length)),
+                   bigram = rep(0, sum(sent_length)),
+                   trigram = rep(0, sum(sent_length)),
+                   fourgram = rep(0, sum(sent_length)))
+  
+  # Subset data.table by sentence id
+  # Calculate probabilities and assign them in data.table
+  for (i in 1:len){
+    dt[id == i, unigram := getUniProbs(sent_words[[i]])] 
+    dt[id == i, bigram := getBiProbs(sent_words[[i]])] 
+    dt[id == i, trigram := getTriProbs(sent_words[[i]])] 
+    dt[id == i, fourgram := getFourProbs(sent_words[[i]])] 
+    
+  }
+  dt[1:.N]
+}
+
+```
+
+```{r make_lambda_permutation, appendix=TRUE}
+
+library(combinat)
+
+# Generate sets of lambda values systematically
+# distributing values of 1 in 0.1 interval into 4 bins in all possible way 
+# excluding lambda for unigram = 0
+
+# Find dividing positions
+comb <- t(combn(13, 3, simplyfy = TRUE))
+pos_n <- choose(13, 3)
+m <- matrix(rep(0.1, pos_n*13), nrow = pos_n)
+
+# Assign 0 at dividing positions
+for (i in 1:pos_n){
+  m[i, comb[i, ]] <- 0
+}
+
+# (I refered below function at:
+# https://stackoverflow.com/questions/16357962/r-split-numeric-vector-at-position)
+splitAt <- function(x, pos){
+  list(x[1:(pos[1]-1)], x[pos[1]:(pos[2]-1)],
+       x[pos[2]:(pos[3]-1)], x[pos[3]:length(x)])
+}
+
+ls <- list()
+for (i in 1:pos_n){
+  ls <- append(ls, splitAt(m[i,], comb[i,]))
+}
+
+results <- sapply(ls, sum)
+
+results_m <- matrix(results, nrow = pos_n, byrow = TRUE)
+
+lambda_dt <- data.table(results_m)
+lambda_dt <- lambda_dt[!V1 == 0]
+
+```
+
+
+```{r get_probs_table_for_devset1, appendix=TRUE}
+
+# Set keys on data.table to filter faster
+keys <- c("history", "word")
+setkeyv(uni_table, keys)
+setkeyv(bi_table, keys)
+setkeyv(tri_table, keys)
+setkeyv(four_table, keys)
+
+# Get probabilities data.table for first 10000 sentences in devset
+prob_dt1 <- getProbsDT(dev[1:10000])
+
+```
+
+```{r function_log_probs , appendix=TRUE}
+getLogProbs <- function(dt, lambda){
+  # Multiply each probability by lambda
+  dt[,`:=`(uni_wtd = unigram*lambda[1],
+           bi_wtd = bigram*lambda[2],
+           tri_wtd = trigram*lambda[3],
+           four_wtd = fourgram*lambda[4],
+           prob = rep(0, .N))]
+  
+  # Sum weighted probabilities for each word
+  dt[, prob := uni_wtd + bi_wtd + tri_wtd + four_wtd]
+  # Get log probabilities for each sentence
+  dt[,  sum(log(prob)),  by = id]
+  
+}
+
+# Take data.table of probabilities + data.table of lambdas
+# and return mean log probabilities on different set of lambda
+getMeanLogProbs <- function(dt, lambdas){
+  
+  n_sent <- dt[.N, id]
+  n_lambda <- nrow(lambdas)
+  logProbs <- matrix(rep(0, n_sent*n_lambda), nrow = n_sent)
+  for (i in 1:n_lambda){
+    results <- getLogProbs(dt, as.numeric(lambdas[i]))
+    logProbs[, i] <- results$V1
+  }
+
+  colMeans(logProbs)
+}
+
+```
+
+```{r get_mean_logprob, appendix=TRUE}
+
+mean_log_prob1 <- getMeanLogProbs(prob_dt1, lambda_dt)
+
+```
+
+
+
+```{r plot_log_probs, appendix=TRUE,  fig.dim=c(8,3)}
+lambda_prob <- cbind(lambda_dt, mean_log_prob1)
+lambda_prob[V1 != 0 & V2 == 0 & V3 == 0 & V4 == 0, weight := "unigram_only"]
+lambda_prob[V1 != 0 & V2 != 0 & V3 == 0 & V4 == 0, weight := "unigram_2gram"]
+lambda_prob[V1 != 0 & V2 == 0 & V3 != 0 & V4 == 0, weight := "unigram_3gram"]
+lambda_prob[V1 != 0 & V2 == 0 & V3 == 0 & V4 != 0, weight := "unigram_4gram"]
+lambda_prob[V1 != 0 & V2 != 0 & V3 != 0 & V4 == 0, weight := "unigram_2gram_3gram"]
+lambda_prob[V1 != 0 & V2 != 0 & V3 == 0 & V4 != 0, weight := "unigram_2gram_4gram"]
+lambda_prob[V1 != 0 & V2 == 0 & V3 != 0 & V4 != 0, weight := "unigram_3gram_4gram"]
+lambda_prob[V1 != 0 & V2 != 0 & V3 != 0 & V4 != 0, weight := "unigram_2gram_3gram_4gram"]
+
+lambda_prob[, weight2 := str_c(V1, V2, V3, V4, sep = ", ") ]
+subset_lambda_prob <- lambda_prob %>%
+  group_by(weight) %>%
+  filter(mean_log_prob1 == max(mean_log_prob1))
+
+g <- ggplot(lambda_prob, aes(weight, mean_log_prob1,  fill = weight))
+g <- g + geom_point(shape = 22, size = 3)
+g <- g + scale_x_discrete(labels = NULL)
+g <- g + labs(title = "Fig.3: Average log probabilities of 10000 sentences",
+              x = "", y = "Average log probabilities")
+
+g
+```
+  
+Below outputs shows lambda values that have highest probabilities in each group.  
+
+
+```{r highest_score_table,  appendix = TRUE}
+subset_lambda_prob <- lambda_prob %>%
+  group_by(weight) %>%
+  filter(mean_log_prob1 == max(mean_log_prob1)) %>%
+  arrange(desc(mean_log_prob1)) %>%
+  transmute(lambdas = weight2, weight = weight, 
+            sentence.log.prob = mean_log_prob1) %>%
+  data.table()
+
+subset_lambda_prob
+
+```
+
+Results show that,  
+
+- Interpolating all the N-grams produces the best results.  
+- 2-grams contribute to the better results the most.  
+- The optimal lambda values are $\lambda_{1} = 0.2,\, \lambda_{2} =0.5, \,\lambda_{3} = 0.2, \,\lambda_{4} = 0.1$.  
+
+
+>#### 5. Test the First Model  
+
+
+We have cleaned, analyzed data, and built the first model. Now we need to test  
+
+- Data size 
+- Accuracy  
+- Speed  
+
+##### 5.1 Data size 
+For the platform we are going to deploy our application(Shiny server free plan), there is a data size limitation, which is a maximum size of 1 GB. but our data tables are closer to 3GB.
+
+```{r object_size,  appendix=TRUE}
+# ------------------------------------------------------------------------------
+# 5. Test the First Model  
+# ------------------------------------------------------------------------------
+
+# Get details of original probability tables we trained
+
+# Object size
+Object_size1 <- c(getMb(object.size(uni_table[,.(history, word, prob)])),
+  getMb(object.size(bi_table[,.(history, word, prob)])),
+  getMb(object.size(tri_table[,.(history, word, prob)])),
+  getMb(object.size(four_table[,.(history, word, prob)])))
+
+# the number of rows of probability tables
+unique_ngram_with_singletons <- c(uni_table[, .N], bi_table[, .N], tri_table[, .N], four_table[, .N])
+
+```
+
+In the section 3.3, we found that there are many N-grams that only appear once(singletons). Since those N-grams are not likely to appear often, the performance of the model may not be affected too much without them and the number of singletons are many, thus we can reduce data size significantly.  
+
+
+To see the difference of two models, we can calculate *Perplexity* of the sentences in the test set using the probability tables that we trained, and the new tables of which probabilities are re-calculated without singletons. (The optimal values of lambdas also have to be searched using held-out set for the latter.)  
+
+
+*The formula for the sentence(length N)*   
+
+$Perplexity(sentence) = P(sentence)^{-1/N} = \sqrt[N]{\frac{1}{P(sentence)}}$
+
+*(Perplexity is a measure of how well the model gives the probabilities on unseen sentences. In above formula, the higher the probability of the sentence, gives the lower perplexity, thus the better model gives lower perplexity.)*  
+  
+
+```{r preprocess_test_set,  appendix=TRUE}
+# Preprocess test set
+# Get OOV rate
+test_dt <- prep(test)
+oov_words_n <- test_dt[!word %chin% vocab, .N]
+test_words_count <- test_dt[,.N]
+oov_rate <- paste0(round((oov_words_n/test_words_count)*100, 2), "%")
+
+```
+
+
+```{r get_probabilities_dt_for_testset,  appendix=TRUE}
+# Replace out of vocabulary word to "UNK"
+# then make them back to sentences
+test_dt <- prep2(test_dt, vocab)
+test_sent <- makeSentence(test_dt)
+
+# Get data.table of all N-gram probability from the original table
+# for 10000 sentences of test set
+prob_dt_test1 <- getProbsDT(test_sent[1:10000])
+```
+
+
+```{r perplexity_1,  appendix=TRUE}
+# Function to calculate perplexity 
+# Take data.table of all the probabilities of the sentences and lambda
+# return peplexities of each sentence
+
+getPPL <- function(dt, lambda){
+  # Multiply each probability by lambda
+  dt[,`:=`(uni_wtd = unigram*lambda[1],
+           bi_wtd = bigram*lambda[2],
+           tri_wtd = trigram*lambda[3],
+           four_wtd = fourgram*lambda[4],
+           prob = rep(0, .N))]
+  
+  # Sum weighted probabilities for each word
+  dt[, prob := uni_wtd + bi_wtd + tri_wtd + four_wtd]
+  # Get perplexities for each sentence
+  dt[,  (exp(sum(log(prob))))^-(1/(.N)),  by = id]
+
+}
+
+lambda1 <- c(0.2, 0.5, 0.2, 0.1)
+ppl_1 <- getPPL(prob_dt_test1, lambda1)
+
+```
+
+
+```{r remove_singleton,  appendix=TRUE}
+# Exclude singletons
+bi_table <- getProbTable(bi_counts[n != 1], 2)
+tri_table <- getProbTable(tri_counts[n != 1], 3)
+four_table <- getProbTable(four_counts[n != 1], 4)
+
+unique_ngram_without_singletons <- c(uni_table[, .N], 
+                                     bi_table[, .N], 
+                                     tri_table[, .N], 
+                                     four_table[, .N])
+
+```
+
+```{r get_prob_table_2,  appendix=TRUE}
+# get new probability data.table of devset for searching optimal lambdas 
+dt_2 <- getProbsDT(dev[1:10000])
+
+```
+
+```{r find_lambda_2,  appendix=TRUE}
+# Calculate optimal lambda values
+mean_log_prob2 <- getMeanLogProbs(dt_2, lambda_dt)
+lambda2 <- as.numeric(lambda_dt[which.max(mean_log_prob2)])
+
+```
+
+
+
+```{r calculate_prb_wtd,  appendix=TRUE}
+# Calculate probabilities of the sentences in the test set
+# using new probability table
+prob_dt_test2 <- getProbsDT(test_sent[1:10000])
+
+```
+
+```{r ppl_2,  appendix=TRUE}
+# Calculate perplextiy of the test set
+ppl_2 <- getPPL(prob_dt_test2, lambda2)
+
+```
+
+
+*The summary of perplexities of the two different model on 10000 sentences of the test set *  
+
+```{r comparison_ppl,  appendix=TRUE}
+comparison_ppl <- rbind(summary(ppl_1$V1), summary(ppl_2$V1))
+row.names(comparison_ppl) <- c("with singletons", "without singletons")
+comparison_ppl
+```
+
+
+*Comparison of data size, unique N-gram counts, weights with(left) and without(right) singletons *
+```{r object_size_2,  appendix=TRUE}
+Object_size2 <- c(getMb(object.size(uni_table[,.(history, word, prob)])),
+  getMb(object.size(bi_table[,.(history, word, prob)])),
+  getMb(object.size(tri_table[,.(history, word, prob)])),
+  getMb(object.size(four_table[,.(history, word, prob)])))
+
+obs <- data.frame(Object_size1,
+             unique_ngram_with_singletons, 
+             lambda1,
+             Object_size2, 
+             unique_ngram_without_singletons,
+             lambda2)
+
+row.names(obs) <- c("Unigram.table", "2-gram.table", "3-gram.table", "4-gram.table")
+
+names(obs) <- c("With singletons", "#Unique", "Weight",
+                "Without singletons", "#Unique", "Weight")
+obs
+```
+
+Results show that,  
+  
+- Removing singletons reduces data size enormously.
+- Average perplexity increased around 18%
+- Optimal lambda values are the same.
+
+
+
+##### 5.2 Accuracy and Runtime of the first model  
+
+Now We actually predict every word in 100 sentences in the test set according to its previous words and evaluate if the correct word is in the set of predicted words. The model we use is the one that we excluded singletons.  
+
+Below table is the predictions of few sentences as examples. The "word" column is the words of the sentences (EOS means end of the sentence "."), V1 - V2 columns are top 5 words the model predicted in ascending order of the probability, "top_3" and "top_5"  columns show if the correct word is in the predicted top3/5 words respectively, "run_time" column is a execution time to get predictions in second.
+```{r testing_model_function,  appendix=TRUE}
+
+
+# Get predictions of the first word
+getP1 <- function(pred_n = 5){
+  pattern1 <- "^BOS BOS BOS$"
+  pattern2 <- "^BOS BOS$"
+  pattern3 <- "^BOS$"
+  ng4 <- four_table[str_detect(history, pattern1)]
+  ng3 <- tri_table[str_detect(history, pattern2)] 
+  ng2 <- bi_table[str_detect(history, pattern3)]
+  all <- rbind(ng4, ng3, ng2, uni_table)
+  all[, .(prob_sum = sum(prob_wtd)), 
+      by = word][order(prob_sum, decreasing = TRUE)][1:pred_n, word]
+}
+
+
+# Get predictions by history of one word
+getP2 <- function(w, pred_n = 5){
+  pattern1 <- str_glue("^BOS BOS ", w, "$")
+  pattern2 <- str_glue("^BOS ", w, "$")
+  pattern3 <- str_glue("^", w, "$")
+  
+  ng4 <- four_table[str_detect(history, pattern1)]
+  ng3 <- tri_table[str_detect(history, pattern2)] 
+  ng2 <- bi_table[str_detect(history, pattern3)]
+  all <- rbind(ng4, ng3, ng2, uni_table)
+  all[, .(prob_sum = sum(prob_wtd)), by = word][order(prob_sum, decreasing = TRUE)][1:pred_n, word]
+}
+
+
+# Get predictions by history of 2 words
+getP3 <- function(w1, w2, pred_n = 5){
+  pattern1 <- str_glue("^BOS ", w1, "\\s", w2, "$")
+  pattern2 <- str_glue("^", w1, "\\s", w2, "$")
+  pattern3 <- str_glue("^", w2, "$")
+  
+  ng4 <- four_table[str_detect(history, pattern1)]
+  ng3 <- tri_table[str_detect(history, pattern2)] 
+  ng2 <- bi_table[str_detect(history, pattern3)]
+  all <- rbind(ng4, ng3, ng2, uni_table)
+  all[, .(prob_sum = sum(prob_wtd)), by = word][order(prob_sum, decreasing = TRUE)][1:pred_n, word]
+}
+
+
+
+
+# Get predictions by history of 3 words
+getPred <- function(w1, w2, w3, pred_n = 5){
+  pattern1 <- str_glue("^", w1, "\\s", w2, "\\s", w3, "$")
+  pattern2 <- str_glue("^", w2, "\\s", w3, "$")
+  pattern3 <- str_glue("^", w3, "$")
+  
+  ng4 <- four_table[str_detect(history, pattern1)]
+  ng3 <- tri_table[str_detect(history, pattern2)] 
+  ng2 <- bi_table[str_detect(history, pattern3)]
+  all <- rbind(ng4, ng3, ng2, uni_table)
+  all[, .(prob_sum = sum(prob_wtd)), by = word][order(prob_sum, decreasing = TRUE)][1:pred_n, word]
+  
+}
+
+# Define a function to give predictions for test set
+# Take sentence and a vector of predicted words for the first word of the sentence(p1)
+# Return the data.table of top5 words that the model predicted and "YES/NO"
+# if the word is in predicted words
+
+
+getTopN <- function(sentence, pred_n = 5){
+  # Add EOS to the sentence
+  sentence <- str_glue(sentence, " EOS")
+  # Break the sentence into words
+  s <- unlist(str_split(sentence, " "))
+  n <- length(s)
+  
+  # Make empty table
+  pred <- matrix(rep("", n*pred_n), nrow = n)
+  pred[1,] <- getP1(pred_n = pred_n)
+  pred[2,] <- getP2(s[1], pred_n = pred_n)
+  pred[3,] <- getP3(s[1], s[2], pred_n = pred_n)
+
+  if (n > 3){
+    for(i in 3:(n-1)){
+      pred[i+1,] <- getPred(s[i-2], s[i-1], s[i], pred_n = pred_n)
+    }
+  }
+  data.table(word = s, pred)
+}
+
+
+
+```
+
+```{r predicted_words_on_testset,  appendix=TRUE}
+# Multiply each probability by lambda value 
+lambdas <- c(0.2, 0.5, 0.2, 0.1)
+uni_table[, prob_wtd := prob*lambdas[1]]
+bi_table[, prob_wtd := prob*lambdas[2]]
+tri_table[, prob_wtd := prob*lambdas[3]]
+four_table[, prob_wtd := prob*lambdas[4]]
+
+keys <- c("history", "word")
+setkeyv(uni_table, keys)
+setkeyv(bi_table, keys)
+setkeyv(tri_table, keys)
+setkeyv(four_table, keys)
+
+results_dt <- data.table()
+for (i in 1:100){
+  results_dt <- rbind(results_dt, getTopN(test_sent[i]))
+}
+
+
+```
+
+```{r get_run_time,  appendix=TRUE}
+
+# Function for get runtime
+# Take a sentence and return a vector of runtime
+
+getRunTime <- function(sentence, pred_n = 5){
+  # Add EOS to the sentence
+  sentence <- str_glue(sentence, " EOS")
+  # Break the sentence into words
+  s <- unlist(str_split(sentence, " "))
+  n <- length(s)
+  
+  # Make empty table
+  time <- rep(0, n)
+  time[1] <- system.time(getP1(pred_n = pred_n), gcFirst = FALSE)[1]
+  time[2] <- system.time(getP2(s[1], pred_n = pred_n), gcFirst = FALSE)[1]
+  time[3] <- system.time(getP3(s[1], s[2], pred_n = pred_n), gcFirst = FALSE)[1]
+  
+  if (n > 3){
+    for(i in 3:(n-1)){
+      time[i+1] <- system.time(getPred(s[i-2], s[i-1], s[i], pred_n = pred_n), gcFirst = FALSE)[1]
+    }
+  }
+  time
+}
+
+runtime <- c()
+for (i in 1:100){
+  runtime <- append(runtime, getRunTime(test_sent[i]))
+}
+```
+
+
+
+
+```{r accuracy,  appendix=TRUE}
+
+top_3 <- rep("", nrow(results_dt))
+for (i in 1:nrow(results_dt)){
+  top_3[i] <- ifelse(results_dt$word[i] %in% c(results_dt$V1[i],
+                                                     results_dt$V2[i],
+                                                     results_dt$V3[i]), "YES", "NO")
+  
+}
+top_5 <- rep("", nrow(results_dt))
+for (i in 1:nrow(results_dt)){
+  top_5[i] <- ifelse(results_dt$word[i] %in% c(results_dt$V1[i],
+                                                        results_dt$V2[i],
+                                                        results_dt$V3[i],
+                                                        results_dt$V4[i],
+                                                        results_dt$V5[i]), "YES", "NO")
+  
+}
+
+
+results_dt <- cbind(results_dt, top_3, top_5, runtime)
+results_dt[1:20]
+```
+
+*Results* 
+
+```{r summary_results,  appendix=TRUE}
+n_words <- nrow(results_dt)
+top_3_accuracy <- paste0(round((sum(top_3 == "YES")/n_words)*100, 2), "%")
+top_5_accuracy <- paste0(round((sum(top_5 == "YES")/n_words)*100, 2), "%")
+avg_runtime <- paste(round(mean(runtime), 2), "sec")
+data.frame(n_words, top_3_accuracy, top_5_accuracy, avg_runtime)
+
+```
+
+##### 5.3 Findings  
+
+- We made a vocabulary list according to the frequency in the training data, which is `r length(vocab)` words. The words in the test set that are not in this vocabulary list are treated as "UNK" and the proportion of those words (Out of Vocabulary rate) was `r oov_rate`.
+- The proportion of the singletons are high, especially in higher order N-grams. Considering the data limit on the platform and speed to predict, it may be good idea to remove those.  
+- Accuracy of this model is not satisfactory. 
+- Speed needs to be improved for better user experience. We may have to consider how to store N-gram model more efficiently to reduce the time for filtering operations.(data.table was used in this model)
+
+
+>#### 6. Conclusion   
+
+The results show that the model still needs to be improved. We experimented with a half of the data, but it is not generalized very well for unseen data. We can add more data but remove low probability N-grams, repeat the process we did in this analysis to get better accuracy as well as finding the more efficient way to store the model for speed.
+
+
+>#### References  
+
+[Speech and Language Processing : N-gram Language Model / Daniel Jurafsky & James H. Martin](https://web.stanford.edu/~jurafsky/slp3/3.pdf)  
+  
+    
+      
+      
+
+
+
+
+```{r all-code, ref.label = knitr::all_labels(appendix == TRUE), echo = FALSE,eval = FALSE}
+
+
